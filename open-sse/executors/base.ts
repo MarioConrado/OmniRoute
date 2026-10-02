@@ -226,6 +226,7 @@ export type ExecuteInput = {
 };
 
 export type CountTokensInput = {
+  clientHeaders?: Record<string, string> | null;
   body: Record<string, unknown>;
   credentials: ProviderCredentials;
   log?: ExecutorLog | null;
@@ -656,12 +657,12 @@ export class BaseExecutor {
     return query ? `${normalizedPath}?${query}` : normalizedPath;
   }
 
-  async countTokens({ model, body, credentials, signal, log }: CountTokensInput) {
+  async countTokens({ model, body, credentials, signal, log, clientHeaders }: CountTokensInput) {
     const url = this.buildCountTokensUrl(model, credentials);
     if (!url) return null;
     this.assertOutboundUrlAllowed(url); // GHSA-4f49
 
-    const headers = this.buildHeaders(credentials, false);
+    const headers = this.buildHeaders(credentials, false, clientHeaders, model, undefined, body);
     const requestBody =
       body && typeof body === "object"
         ? {
@@ -669,6 +670,22 @@ export class BaseExecutor {
             model,
           }
         : { model };
+
+    if (this.provider === "claude") {
+      const nativeClient =
+        clientHeaders?.["x-app"] === "cli" ||
+        /claude-(?:code|cli)/i.test(clientHeaders?.["user-agent"] || "");
+      const clientBeta =
+        clientHeaders?.["anthropic-beta"] ?? clientHeaders?.["Anthropic-Beta"] ?? null;
+      headers["anthropic-beta"] = mergeClientAnthropicBeta(
+        headers["anthropic-beta"] || "",
+        clientBeta,
+        undefined,
+        model,
+        requestBody,
+        nativeClient
+      );
+    }
 
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
     let activeSignal = signal || null;
@@ -1096,6 +1113,16 @@ export class BaseExecutor {
             // must opt in with x-omniroute-thinking; force-injecting adaptive thinking
             // leaks non-standard reasoning replay fields back into those clients.
             const isHaiku = typeof tb.model === "string" && tb.model.includes("haiku");
+            // Claude 4.5 and earlier accept manual thinking, not adaptive thinking.
+            // Preserve a native request's absent or explicit manual thinking there.
+            const claudeVersion =
+              /(?:^|[/.])claude-(?:(?:opus|sonnet)-)?(\d+)(?:[-.](\d{1,2})(?!\d))?/.exec(
+                model.toLowerCase()
+              );
+            const legacyThinkingModel =
+              claudeVersion !== null &&
+              (Number(claudeVersion[1]) < 4 ||
+                (Number(claudeVersion[1]) === 4 && Number(claudeVersion[2] ?? 0) < 6));
             // #5312 RC-B: honor the operator's proxy-level Thinking-Budget mode.
             // `auto` means "strip — let the provider decide", so suppress the default
             // adaptive injection. Passthrough/no-config keeps the native Claude Code
@@ -1111,7 +1138,11 @@ export class BaseExecutor {
               delete tb.thinking;
               delete tb.context_management;
               delete tb.output_config;
-            } else if (tb.thinking === undefined && tb.output_config === undefined) {
+            } else if (
+              !legacyThinkingModel &&
+              tb.thinking === undefined &&
+              tb.output_config === undefined
+            ) {
               tb.thinking = { type: "adaptive" };
               tb.context_management = {
                 edits: [{ type: "clear_thinking_20251015", keep: "all" }],
@@ -1122,7 +1153,11 @@ export class BaseExecutor {
             // When an operator budget (custom/adaptive mode) produced an enabled block
             // upstream, remap it to adaptive + output_config.effort here.
             const th = tb.thinking as Record<string, unknown> | undefined;
-            if (th?.type === "enabled" && tbMode !== ThinkingMode.PASSTHROUGH) {
+            if (
+              !legacyThinkingModel &&
+              th?.type === "enabled" &&
+              tbMode !== ThinkingMode.PASSTHROUGH
+            ) {
               const b = typeof th.budget_tokens === "number" ? th.budget_tokens : 0;
               tb.thinking = { type: "adaptive" };
               tb.output_config = {
@@ -1264,7 +1299,8 @@ export class BaseExecutor {
                 // model that does not qualify (e.g. Haiku), which Anthropic rejects (#10119).
                 model,
                 // Gate skills-2025-10-02 on presence of code_execution tool in transformed body (#14200):
-                tb
+                tb,
+                this.provider === "claude" && Boolean(isClaudeCodeClient)
               ),
               "anthropic-dangerous-direct-browser-access": "true",
               "x-app": "cli",
